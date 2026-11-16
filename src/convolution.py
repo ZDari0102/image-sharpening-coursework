@@ -17,7 +17,10 @@ def convolve2d_naive(image: np.ndarray, kernel: np.ndarray) -> np.ndarray:
 
 
 def convolve2d_opencv(image: np.ndarray, kernel: np.ndarray) -> np.ndarray:
-    return cv2.filter2D(image, ddepth=-1, kernel=kernel)
+    # Повторяем крайние пиксели и сохраняем отклик в выходном буфере float32.
+    return cv2.filter2D(
+        image, ddepth=cv2.CV_32F, kernel=kernel, borderType=cv2.BORDER_REPLICATE
+    )
 
 
 def clip_to_uint8(image: np.ndarray) -> np.ndarray:
