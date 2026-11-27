@@ -1,3 +1,4 @@
+import csv
 import os
 import sys
 import time
@@ -5,18 +6,33 @@ import tracemalloc
 from collections.abc import Callable
 
 import cv2
+import matplotlib
+
+# Файловый backend позволяет сохранять рисунки без окон и графической сессии.
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
 from convolution import clip_to_uint8, convolve2d_naive, convolve2d_opencv
 from convolution_vectorized import convolve2d_vectorized
 from kernels import KERNELS
+from metrics import compute_metrics
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_DIR = os.path.dirname(SCRIPT_DIR)
-INPUT_PATH = os.path.join(PROJECT_DIR, "data", "1_high.png")
+INPUT_DIR = os.path.join(PROJECT_DIR, "data")
 OUTPUT_DIR = os.path.join(PROJECT_DIR, "results")
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
 MIN_PROFILE_NS = 200_000_000
+CSV_FIELDS = (
+    "image",
+    "width",
+    "height",
+    "kernel",
+    "variance_laplacian",
+    "psnr_db",
+    "ssim",
+)
 
 IMPLEMENTATIONS = (
     ("Naive", convolve2d_naive),
@@ -80,7 +96,10 @@ def profile_execution(
     return result, caption
 
 
-def process_and_save(image: np.ndarray, kernel_name: str, kernel: np.ndarray) -> None:
+def process_and_save(
+    image: np.ndarray, kernel_name: str, kernel: np.ndarray, image_name: str
+) -> np.ndarray:
+    """Сохранить сравнение и вернуть изображение NumPy для оценки качества."""
     profiled = [
         profile_execution(image, kernel, func, label) for label, func in IMPLEMENTATIONS
     ]
@@ -103,22 +122,86 @@ def process_and_save(image: np.ndarray, kernel_name: str, kernel: np.ndarray) ->
         axis.set_title(caption, fontsize=10)
         axis.axis("off")
 
-    figure.suptitle(f"Kernel: {kernel_name}", fontsize=14)
-    figure.savefig(os.path.join(OUTPUT_DIR, f"{kernel_name}_comparison.png"), dpi=150)
-    plt.show()
+    figure.suptitle(f"{image_name} | Kernel: {kernel_name}", fontsize=14)
+    # Полное имя входного файла различает, например, photo.png и photo.jpg.
+    output_path = os.path.join(OUTPUT_DIR, f"{image_name}_{kernel_name}_comparison.png")
+    figure.savefig(output_path, dpi=150)
+    # Освобождаем ресурсы рисунка перед следующей обработкой в пакете.
     plt.close(figure)
+    print(f"Сохранено: {output_path}", flush=True)
+    # Отклики трёх реализаций совпали. Для метрик используем результат NumPy
+    # в uint8. После выхода из функции буферы float32 становятся ненужными.
+    return panels[2][1]
+
+
+def write_metrics_row(
+    writer: csv.DictWriter,
+    image_name: str,
+    image: np.ndarray,
+    kernel_name: str,
+    values: dict[str, float],
+) -> None:
+    """Вывести метрики и записать строку CSV для импорта в таблицу."""
+    print(
+        f"[Метрики {kernel_name}] VoL: {values['variance_laplacian']:.4f} | "
+        f"PSNR: {values['psnr_db']:.4f} дБ | SSIM: {values['ssim']:.6f}",
+        flush=True,
+    )
+    # Разделитель «;», десятичная запятая и UTF-8 BOM удобны для русской версии Excel.
+    # В CSV сохраняем точность float, округление применяется только в терминале.
+    writer.writerow(
+        {
+            "image": image_name,
+            "width": image.shape[1],
+            "height": image.shape[0],
+            "kernel": kernel_name,
+            **{name: str(value).replace(".", ",") for name, value in values.items()},
+        }
+    )
 
 
 def main() -> None:
-    image = load_grayscale(INPUT_PATH)
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    print(f"Загружено изображение: {image.shape}", flush=True)
+    if not os.path.isdir(INPUT_DIR):
+        sys.exit(f"Папка с изображениями не найдена: {INPUT_DIR}")
 
-    for name, kernel in KERNELS.items():
-        print(f"\nОбработка ядром: {name}", flush=True)
-        process_and_save(image, name, kernel)
+    image_names = [
+        name
+        for name in sorted(os.listdir(INPUT_DIR))
+        if os.path.splitext(name)[1].lower() in IMAGE_EXTENSIONS
+        and os.path.isfile(os.path.join(INPUT_DIR, name))
+    ]
+    if not image_names:
+        sys.exit(f"В папке нет поддерживаемых изображений: {INPUT_DIR}")
+
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    metrics_path = os.path.join(OUTPUT_DIR, "quality_metrics.csv")
+    # Каждый запуск формирует новую таблицу. Сбрасываем буфер после каждой строки,
+    # чтобы результаты завершённых вычислений сохранялись и при долгом запуске.
+    with open(metrics_path, "w", encoding="utf-8-sig", newline="") as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=CSV_FIELDS, delimiter=";")
+        writer.writeheader()
+        for index, image_name in enumerate(image_names, start=1):
+            # Загружаем файлы по очереди, ограничивая объём входных данных в памяти.
+            image = load_grayscale(os.path.join(INPUT_DIR, image_name))
+            print(
+                f"\nИзображение {index}/{len(image_names)}: {image_name} | {image.shape}",
+                flush=True,
+            )
+            write_metrics_row(
+                writer, image_name, image, "original", compute_metrics(image, image)
+            )
+            csv_file.flush()
+
+            for name, kernel in KERNELS.items():
+                print(f"\nОбработка ядром: {name}", flush=True)
+                filtered = process_and_save(image, name, kernel, image_name)
+                # Рабочие буферы метрик выделяются после завершения профилирования.
+                values = compute_metrics(image, filtered)
+                write_metrics_row(writer, image_name, image, name, values)
+                csv_file.flush()
 
     print(f"\nРезультаты сохранены в: {os.path.abspath(OUTPUT_DIR)}")
+    print(f"Метрики качества сохранены в: {metrics_path}")
 
 
 if __name__ == "__main__":
